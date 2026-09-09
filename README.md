@@ -77,29 +77,28 @@ You will see the 5 variables that match the real repository:
 
 ---
 
-### Step 3: Configure Variables in Your GitHub Test Repo
+### Step 3: Configure Variables in Your GitHub Test Repo (`lucaszulchner-dt/ci-cd-testing`)
 
-Create a test repository on GitHub (e.g. `cicd-tag-test`).
-
-Push the test code:
+If you haven't pushed the test files to `https://github.com/lucaszulchner-dt/ci-cd-testing` yet:
 ```bash
 cd /home/lnx/wrk/ai-career-advisor/cicdterraform_test
-git init
+git remote set-url origin git@github.com:lucaszulchner-dt/ci-cd-testing.git || git remote add origin git@github.com:lucaszulchner-dt/ci-cd-testing.git
 git add .
-git commit -m "feat: initial test harness setup"
-git branch -M main
-git remote add origin git@github.com:<YOUR_USER>/cicd-tag-test.git
+git commit -m "feat: setup identical CI/CD test harness"
 git push -u origin main
 ```
 
-#### Option A: Set via GitHub CLI (Fastest — 5 seconds)
+#### Option A: Set via GitHub CLI (Fastest — 10 seconds)
 ```bash
-# In the test repo directory:
-gh variable set WIF_PROVIDER --body "$(terraform -chdir=terraform output -raw github_action_vars | jq -r .WIF_PROVIDER)"
-gh variable set WIF_SERVICE_ACCOUNT --body "mock-app-deployer@lucas--rios-sandbox.iam.gserviceaccount.com"
-gh variable set GCP_REGION --body "europe-west1"
-gh variable set GAR_REGISTRY --body "europe-west1-docker.pkg.dev/lucas--rios-sandbox/mock-app-repo"
-gh variable set GCP_PROJECT_ID --body "lucas--rios-sandbox"
+# Export the WIF provider string from terraform output:
+WIF_PROV=$(terraform -chdir=terraform output -json github_action_vars | jq -r .WIF_PROVIDER)
+
+# Set all 5 variables on your test repo:
+gh variable set WIF_PROVIDER --repo lucaszulchner-dt/ci-cd-testing --body "${WIF_PROV}"
+gh variable set WIF_SERVICE_ACCOUNT --repo lucaszulchner-dt/ci-cd-testing --body "mock-app-deployer@lucas--rios-sandbox.iam.gserviceaccount.com"
+gh variable set GCP_REGION --repo lucaszulchner-dt/ci-cd-testing --body "europe-west1"
+gh variable set GAR_REGISTRY --repo lucaszulchner-dt/ci-cd-testing --body "europe-west1-docker.pkg.dev/lucas--rios-sandbox/mock-app-repo"
+gh variable set GCP_PROJECT_ID --repo lucaszulchner-dt/ci-cd-testing --body "lucas--rios-sandbox"
 ```
 
 #### Option B: Set via GitHub Web UI

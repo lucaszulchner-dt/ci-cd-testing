@@ -64,6 +64,8 @@ resource "google_iam_workload_identity_pool_provider" "github_provider" {
     "attribute.repository_owner" = "assertion.repository_owner"
   }
 
+  attribute_condition = "assertion.repository_owner == '${var.github_owner}'"
+
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
   }
@@ -73,7 +75,7 @@ resource "google_iam_workload_identity_pool_provider" "github_provider" {
 resource "google_service_account_iam_member" "deployer_wif_binding" {
   service_account_id = google_service_account.github_deployer.name
   role               = "roles/iam.workloadIdentityUser"
-  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_pool.name}/*"
+  member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github_pool.name}/attribute.repository_owner/${var.github_owner}"
 }
 
 # IAM Permissions for GitHub Deployer:

@@ -27,3 +27,9 @@ variable "prod_service_name" {
   type        = string
   default     = "mock-app-prod"
 }
+
+variable "github_owner" {
+  description = "GitHub user or organization allowed to authenticate via WIF"
+  type        = string
+  default     = "lucaszulchner-dt"
+}
