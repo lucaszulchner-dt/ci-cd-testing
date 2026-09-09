@@ -168,3 +168,6 @@ In your test repository:
 cd /home/lnx/wrk/ai-career-advisor/cicdterraform_test/terraform
 terraform destroy -auto-approve
 ```
+
+
+random edit test
