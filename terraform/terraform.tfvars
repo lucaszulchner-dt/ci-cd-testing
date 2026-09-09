@@ -1,0 +1,5 @@
+project_id         = "lucas--rios-sandbox"
+region             = "europe-west1"
+artifact_repo_name = "mock-app-repo"
+dev_service_name   = "mock-app-dev"
+prod_service_name  = "mock-app-prod"

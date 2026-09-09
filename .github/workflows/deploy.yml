@@ -1,0 +1,190 @@
+name: Mock App CI/CD Test Harness
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: "Target environment to deploy"
+        required: true
+        type: choice
+        options: [dev, prod]
+        default: dev
+      image_tag:
+        description: "Image tag to deploy or rollback (e.g. v1.0.0, sha-abc123456789, or blank for HEAD)"
+        required: false
+        type: string
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name == 'main' }}
+
+env:
+  SERVICE: mock-app
+  IMAGE_NAME: mock-app
+
+jobs:
+  # 1. CI Quality Check (syntax check for mock app)
+  check:
+    name: Code & Syntax Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m py_compile app.py
+
+  # 2. Build container once and deploy to Dev
+  # Runs on merge/push to main or manual dispatch targeting dev
+  build-and-deploy-dev:
+    name: Build & Deploy to Dev
+    needs: check
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.target_env == 'dev')
+    environment: dev
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
+
+      - name: Compute tags and version metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short=12 HEAD)
+          PKG_VERSION="1.0.0"
+          IMAGE="${{ vars.GAR_REGISTRY }}/${{ env.IMAGE_NAME }}"
+          DEPLOY_TAG="sha-${SHORT_SHA}"
+          TAGS="${IMAGE}:${DEPLOY_TAG},${IMAGE}:dev-latest"
+          APP_VERSION="${PKG_VERSION}-dev.${SHORT_SHA}"
+
+          echo "image_base=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "deploy_tag=${DEPLOY_TAG}" >> "$GITHUB_OUTPUT"
+          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          push: true
+          cache-from: type=gha,scope=mock-app
+          cache-to: type=gha,mode=max,scope=mock-app
+
+      - name: Deploy revision to Cloud Run (Dev)
+        run: |
+          SERVICE_NAME="${{ vars.SERVICE_NAME || env.SERVICE }}"
+          IMAGE_TAG="${{ steps.meta.outputs.image_base }}:${{ steps.meta.outputs.deploy_tag }}"
+          echo "Deploying ${IMAGE_TAG} to Dev (${{ vars.GCP_PROJECT_ID }}) service ${SERVICE_NAME}..."
+
+          gcloud run services update "${SERVICE_NAME}" \
+            --image "${IMAGE_TAG}" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --service-account "mock-app-runtime@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --update-env-vars "APP_VERSION=${{ steps.meta.outputs.app_version }},GIT_SHA=${{ steps.meta.outputs.short_sha }}"
+
+  # 3. Promote & Deploy to Prod - Zero Rebuild
+  # Triggered exclusively via workflow_dispatch targeting prod
+  promote-and-deploy-prod:
+    name: Promote & Deploy to Prod
+    if: github.event_name == 'workflow_dispatch' && inputs.target_env == 'prod'
+    environment: prod
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Resolve image & release metadata
+        id: resolve
+        env:
+          IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          IMAGE="${{ vars.GAR_REGISTRY }}/${{ env.IMAGE_NAME }}"
+          SHORT_SHA=$(git rev-parse --short=12 HEAD)
+
+          if [[ -n "${IMAGE_TAG_INPUT}" ]]; then
+            SOURCE_IMAGE="${IMAGE}:${IMAGE_TAG_INPUT}"
+            DEPLOY_TAG="${IMAGE_TAG_INPUT}"
+            GIT_SHA="rollback"
+          else
+            if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
+              echo "::error::Prod releases must run from a v*.*.* tag, or pass image_tag."
+              exit 1
+            fi
+            SOURCE_IMAGE="${IMAGE}:sha-${SHORT_SHA}"
+            DEPLOY_TAG="${REF_NAME}"
+            GIT_SHA="${SHORT_SHA}"
+          fi
+
+          echo "image_base=${IMAGE}"          >> "$GITHUB_OUTPUT"
+          echo "source_image=${SOURCE_IMAGE}"  >> "$GITHUB_OUTPUT"
+          echo "deploy_tag=${DEPLOY_TAG}"      >> "$GITHUB_OUTPUT"
+          echo "git_sha=${GIT_SHA}"            >> "$GITHUB_OUTPUT"
+
+      - name: Verify image exists in Artifact Registry
+        run: |
+          echo "Verifying ${{ steps.resolve.outputs.source_image }} exists in Artifact Registry..."
+          gcloud artifacts docker images describe "${{ steps.resolve.outputs.source_image }}" --quiet > /dev/null
+
+      - name: Promote tags in Artifact Registry (No Rebuild)
+        run: |
+          SOURCE="${{ steps.resolve.outputs.source_image }}"
+          IMAGE="${{ steps.resolve.outputs.image_base }}"
+          TAG="${{ steps.resolve.outputs.deploy_tag }}"
+
+          # If promoting a sha-xyz image to a release tag, stamp the version tag
+          if [[ "${SOURCE}" != "${IMAGE}:${TAG}" ]]; then
+            echo "Tagging ${SOURCE} -> ${IMAGE}:${TAG}"
+            gcloud artifacts docker tags add "${SOURCE}" "${IMAGE}:${TAG}"
+          fi
+
+          # Always point prod-latest to this release image for Terraform
+          echo "Tagging ${SOURCE} -> ${IMAGE}:prod-latest"
+          gcloud artifacts docker tags add "${SOURCE}" "${IMAGE}:prod-latest"
+
+      - name: Deploy revision to Cloud Run (Prod)
+        run: |
+          SERVICE_NAME="${{ vars.SERVICE_NAME || env.SERVICE }}"
+          DEPLOY_IMAGE="${{ steps.resolve.outputs.image_base }}:${{ steps.resolve.outputs.deploy_tag }}"
+          echo "Deploying ${DEPLOY_IMAGE} to Prod (${{ vars.GCP_PROJECT_ID }}) service ${SERVICE_NAME}..."
+
+          gcloud run services update "${SERVICE_NAME}" \
+            --image "${DEPLOY_IMAGE}" \
+            --project "${{ vars.GCP_PROJECT_ID }}" \
+            --region "${{ vars.GCP_REGION }}" \
+            --service-account "mock-app-runtime@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
+            --update-env-vars "APP_VERSION=${{ steps.resolve.outputs.deploy_tag }},GIT_SHA=${{ steps.resolve.outputs.git_sha }}"

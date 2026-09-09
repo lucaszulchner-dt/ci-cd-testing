@@ -1,6 +1,23 @@
 # 🧪 CI/CD & Terraform Sandbox Test Harness
 
-This self-contained test directory allows you to validate the **Trunk-Based Development** + **Zero-Rebuild Tag Promotion** pipeline end-to-end inside your sandbox project (**`lucas--rios-sandbox`**) before applying it to production.
+This directory is a **1-to-1 mirror** of the production architecture designed to test the **Trunk-Based Development** + **Zero-Rebuild Tag Promotion** pipeline end-to-end in your sandbox project (**`lucas--rios-sandbox`**).
+
+The GitHub Actions workflow (`.github/workflows/deploy.yml`) is **100% identical in structure, variables, and authentication (WIF)** to the frontend repository workflow.
+
+---
+
+## 🔒 How Production Gating Works ("GH Actions Gated")
+
+On GitHub personal accounts (free tier), GitHub disables the UI checkbox "Required reviewers" in Environments (which requires GitHub Team/Enterprise or a public repo).
+
+**In our architecture, the release gate is enforced in GitHub Actions code:**
+1. **Push to `main`**: Automatically builds and deploys to **Dev** only.
+2. **Pushing a tag (`git push origin v1.0.0`)**: Does **NOT** trigger any deployment (the tag push trigger was intentionally removed).
+3. **Deploying to Prod**: Requires manual execution via **`workflow_dispatch`**:
+   ```yaml
+   if: github.event_name == 'workflow_dispatch' && inputs.target_env == 'prod'
+   ```
+   Prod deployment is **strictly gated** because it cannot run on its own—it requires an authorized developer to go into the Actions tab, select the release tag, choose `target_env: prod`, and click **Run workflow**.
 
 ---
 
@@ -8,185 +25,147 @@ This self-contained test directory allows you to validate the **Trunk-Based Deve
 
 ```text
 cicdterraform_test/
-├── README.md               <-- Step-by-step Runbook & Memo for tomorrow
-├── app.py                  <-- Ultra-lightweight Python HTTP server (displays env, version, commit SHA)
-├── Dockerfile              <-- Alpine image (builds in ~2 seconds, no npm install needed)
+├── README.md               <-- Complete Step-by-Step Runbook
+├── app.py                  <-- Tiny Python server that displays ENV, version, & commit SHA
+├── Dockerfile              <-- Alpine container (builds in ~2s, no npm needed)
 ├── .github/
 │   └── workflows/
-│       └── deploy.yml      <-- Complete pipeline adapted for your sandbox project
+│       └── deploy.yml      <-- IDENTICAL workflow to the real frontend repository
 └── terraform/
     ├── versions.tf         <-- Google provider (~> 6.0)
-    ├── variables.tf        <-- Project ID (lucas--rios-sandbox), region, service names
-    ├── main.tf             <-- Creates Artifact Registry, IAM, & 2 Cloud Run services (Dev & Prod)
-    ├── outputs.tf          <-- URLs of the Cloud Run services, registry path, SA emails
-    └── terraform.tfvars    <-- Default variable values
+    ├── variables.tf        <-- Defaulted to project: lucas--rios-sandbox
+    ├── main.tf             <-- WIF Pool & Provider + Artifact Registry + 2 Cloud Run services (512Mi) + IAM
+    ├── outputs.tf          <-- Outputs all exact GitHub Actions variables
+    └── terraform.tfvars    <-- Pre-filled configuration
 ```
 
 ---
 
-## 📋 Memo: Step-by-Step Test Procedure for Tomorrow
+## 📋 Step-by-Step Execution Guide
 
-Follow these numbered steps in order.
-
----
-
-### Phase 1: Set Active GCP Project
-
-Run these commands in your local terminal:
-
-```bash
-# 1. Authenticate and point gcloud to your sandbox project
-gcloud auth login
-gcloud config set project lucas--rios-sandbox
-
-# 2. Ensure billing and essential APIs are enabled
-gcloud services enable \
-  run.googleapis.com \
-  artifactregistry.googleapis.com \
-  iam.googleapis.com
-```
-
----
-
-### Phase 2: Provision Infrastructure with Terraform
+### Step 1: Run Terraform Apply in Sandbox
 
 ```bash
 cd /home/lnx/wrk/ai-career-advisor/cicdterraform_test/terraform
-
-# 1. Initialize Terraform
 terraform init
-
-# 2. Review the plan
-terraform plan
-
-# 3. Apply the infrastructure
 terraform apply -auto-approve
 ```
 
-> [!NOTE]
-> **Why Day 1 succeeds automatically**:
-> The Cloud Run services are bootstrapped with Google's public container (`us-docker.pkg.dev/cloudrun/container/hello`). Because both services include:
-> ```hcl
-> lifecycle {
->   ignore_changes = [
->     template[0].containers[0].image,
->     template[0].containers[0].env,
->   ]
-> }
-> ```
-> Terraform succeeds immediately without needing an image in your private registry first. When GitHub Actions deploys later, Terraform will never overwrite your deployments!
+This provisions:
+- Workload Identity Federation (WIF) pool & provider (`test-github-pool`/`github-oidc`)
+- Artifact Registry repository (`mock-app-repo`)
+- GitHub Deployer Service Account (`mock-app-deployer@lucas--rios-sandbox.iam.gserviceaccount.com`)
+- Cloud Run Dev service (`mock-app-dev`) with 512Mi memory
+- Cloud Run Prod service (`mock-app-prod`) with 512Mi memory
 
 ---
 
-### Phase 3: Create GitHub Deployer Credentials
+### Step 2: Retrieve the GitHub Actions Variables
 
-For testing in your sandbox, the simplest authentication method is a Service Account Key:
+Run this command in the `terraform` directory:
 
 ```bash
-# 1. Generate a JSON key for the deployer service account created by Terraform
-gcloud iam service-accounts keys create ~/mock-app-deployer-key.json \
-  --iam-account=mock-app-deployer@lucas--rios-sandbox.iam.gserviceaccount.com
-
-# 2. Copy the JSON key content to your clipboard
-cat ~/mock-app-deployer-key.json
+terraform output github_action_vars
 ```
 
----
-
-### Phase 4: Configure the GitHub Test Repository
-
-1. Create a new test repository on GitHub (e.g. `lucas-rios/cicd-tag-test`).
-2. Push the contents of `cicdterraform_test` to that repository:
-   ```bash
-   cd /home/lnx/wrk/ai-career-advisor/cicdterraform_test
-   git init
-   git add .
-   git commit -m "feat: initial test harness setup"
-   git branch -M main
-   git remote add origin git@github.com:<YOUR_USER>/cicd-tag-test.git
-   git push -u origin main
-   ```
-3. **Set Repository Secret**:
-   * In GitHub: **Settings** $\rightarrow$ **Secrets and variables** $\rightarrow$ **Actions** $\rightarrow$ **New repository secret**.
-   * **Name**: `GCP_SA_KEY`
-   * **Value**: Paste the entire JSON content from `~/mock-app-deployer-key.json`.
-4. **Set Up GitHub Environments**:
-   * In GitHub: **Settings** $\rightarrow$ **Environments** $\rightarrow$ **New environment**.
-   * Create **`dev`**:
-     * No protection rules needed (fully automated).
-   * Create **`prod`**:
-     * Check **Required reviewers**.
-     * Add yourself (`lucas-rios`).
-     * Click **Save protection rules**.
+You will see the 5 variables that match the real repository:
+* `WIF_PROVIDER`: `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/test-github-pool/providers/github-oidc`
+* `WIF_SERVICE_ACCOUNT`: `mock-app-deployer@lucas--rios-sandbox.iam.gserviceaccount.com`
+* `GCP_REGION`: `europe-west1`
+* `GAR_REGISTRY`: `europe-west1-docker.pkg.dev/lucas--rios-sandbox/mock-app-repo`
+* `GCP_PROJECT_ID`: `lucas--rios-sandbox`
 
 ---
 
-### Phase 5: Run the 3 Verification Tests
+### Step 3: Configure Variables in Your GitHub Test Repo
+
+Create a test repository on GitHub (e.g. `cicd-tag-test`).
+
+Push the test code:
+```bash
+cd /home/lnx/wrk/ai-career-advisor/cicdterraform_test
+git init
+git add .
+git commit -m "feat: initial test harness setup"
+git branch -M main
+git remote add origin git@github.com:<YOUR_USER>/cicd-tag-test.git
+git push -u origin main
+```
+
+#### Option A: Set via GitHub CLI (Fastest — 5 seconds)
+```bash
+# In the test repo directory:
+gh variable set WIF_PROVIDER --body "$(terraform -chdir=terraform output -raw github_action_vars | jq -r .WIF_PROVIDER)"
+gh variable set WIF_SERVICE_ACCOUNT --body "mock-app-deployer@lucas--rios-sandbox.iam.gserviceaccount.com"
+gh variable set GCP_REGION --body "europe-west1"
+gh variable set GAR_REGISTRY --body "europe-west1-docker.pkg.dev/lucas--rios-sandbox/mock-app-repo"
+gh variable set GCP_PROJECT_ID --body "lucas--rios-sandbox"
+```
+
+#### Option B: Set via GitHub Web UI
+In your test repository:
+1. Go to **Settings** $\rightarrow$ **Secrets and variables** $\rightarrow$ **Actions** $\rightarrow$ **Variables** tab.
+2. Click **New repository variable** and add each of the 5 variables:
+   * **`WIF_PROVIDER`**: (from `terraform output`)
+   * **`WIF_SERVICE_ACCOUNT`**: `mock-app-deployer@lucas--rios-sandbox.iam.gserviceaccount.com`
+   * **`GCP_REGION`**: `europe-west1`
+   * **`GAR_REGISTRY`**: `europe-west1-docker.pkg.dev/lucas--rios-sandbox/mock-app-repo`
+   * **`GCP_PROJECT_ID`**: `lucas--rios-sandbox`
+
+---
+
+### Step 4: Run the 3 Verification Tests
 
 #### ✅ Test 1: Auto-Deploy to Dev on Merge to `main`
 1. Make a small edit to `app.py` or trigger the workflow via `workflow_dispatch` (target `dev`).
 2. Go to **Actions** $\rightarrow$ **Mock App CI/CD Test Harness**:
-   * Job `build-and-deploy-dev` will execute.
-   * Builds the container in ~2 seconds.
-   * Pushes tags `:sha-<short-sha>` and `:dev-latest` to Artifact Registry.
-   * Updates `mock-app-dev` Cloud Run service.
-3. Open the Dev Cloud Run URL from your Terraform output:
+   * Job `build-and-deploy-dev` executes.
+   * Authenticates via WIF without any service account key!
+   * Builds container once, tags with `:sha-<short-sha>` and `:dev-latest`.
+   * Deploys to `mock-app-dev`.
+3. Check the Dev service:
    ```bash
    curl $(terraform -chdir=terraform output -raw dev_service_url)
    ```
-   * You will see the HTML card showing:
-     * **Environment**: `DEV`
-     * **App Version**: `sha-xxxx`
-     * **Git SHA**: `<commit-sha>`
+   * Displays `APP_VERSION: 1.0.0-dev.<sha>` and `GIT_SHA: <sha>`.
 
-#### ✅ Test 2: Zero-Rebuild Release with Manual Gate to `prod`
+#### ✅ Test 2: Release Tag + Manual Gate (Zero-Rebuild Prod Promotion)
 1. Mark the commit as releasable by pushing a semantic version tag:
    ```bash
    git tag v1.0.0
    git push origin v1.0.0
    ```
+   *(Notice: Pushing the tag does NOT deploy to prod on its own).*
 2. Go to GitHub $\rightarrow$ **Actions** $\rightarrow$ **Mock App CI/CD Test Harness** $\rightarrow$ **Run workflow**:
    * **Use workflow from**: select tag `v1.0.0`.
    * **Target environment**: select `prod`.
    * Click **Run workflow**.
-3. **Observe the Manual Gate**:
-   * The workflow starts `promote-and-deploy-prod` and immediately enters **"Waiting for review"**.
-   * Click **Review deployments** $\rightarrow$ select `prod` $\rightarrow$ click **Approve and deploy**.
-4. **Observe the Promotion**:
-   * Runs in **~15 seconds**.
-   * **NO Docker build occurs**.
-   * It stamps `:v1.0.0` and `:prod-latest` onto the pre-built Dev image.
-   * Updates `mock-app-prod`.
-5. Verify in Artifact Registry:
+3. **Observe the Promotion**:
+   * Job `promote-and-deploy-prod` executes.
+   * **Zero rebuild**: Verifies `:sha-<short-sha>` in Artifact Registry.
+   * Stamps `:v1.0.0` and `:prod-latest` via `gcloud artifacts docker tags add`.
+   * Deploys to `mock-app-prod` in ~15 seconds.
+4. Verify tags in Artifact Registry:
    ```bash
    gcloud artifacts docker images list-tags europe-west1-docker.pkg.dev/lucas--rios-sandbox/mock-app-repo/mock-app
    ```
-   * You will see `:sha-xxxx`, `:dev-latest`, `:v1.0.0`, and `:prod-latest` all pointing to the respective digests!
-6. Open the Prod Cloud Run URL:
+5. Check the Prod service:
    ```bash
    curl $(terraform -chdir=terraform output -raw prod_service_url)
    ```
-   * You will see:
-     * **Environment**: `PROD`
-     * **App Version**: `v1.0.0`
+   * Displays `APP_VERSION: v1.0.0`.
 
-#### ✅ Test 3: 1-Click Rollback Test
+#### ✅ Test 3: Instant 1-Click Rollback
 1. In GitHub Actions $\rightarrow$ **Run workflow**:
-   * Select `prod`.
-   * Under **image_tag**, enter: `v1.0.0` (or any specific earlier SHA).
-   * Click **Run workflow** and approve.
-2. It verifies the image exists and immediately points `mock-app-prod` back to that tag!
+   * Target environment: `prod`.
+   * **image_tag**: enter `v1.0.0` (or any earlier SHA).
+   * Click **Run workflow**.
+2. Immediately rolls back `mock-app-prod` to that exact revision!
 
 ---
 
-### Phase 6: Teardown / Cleanup
-
-When you are finished testing, clean up all sandbox resources with one command:
-
+### Step 5: Teardown / Cleanup
 ```bash
 cd /home/lnx/wrk/ai-career-advisor/cicdterraform_test/terraform
 terraform destroy -auto-approve
-
-# Remove local key file
-rm -f ~/mock-app-deployer-key.json
 ```
