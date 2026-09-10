@@ -112,7 +112,7 @@ jobs:
   # Triggered exclusively via workflow_dispatch targeting prod
   promote-and-deploy-prod:
     name: Promote & Deploy to Prod
-    needs: check
+    needs: [check]
     if: github.event_name == 'workflow_dispatch' && inputs.target_env == 'prod'
     environment: prod
     runs-on: ubuntu-latest
