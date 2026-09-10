@@ -8,13 +8,13 @@ on:
   workflow_dispatch:
     inputs:
       target_env:
-        description: "Target environment to deploy"
+        description: "Environment to promote to"
         required: true
         type: choice
         options: [dev, prod]
         default: dev
       image_tag:
-        description: "Image tag to deploy or rollback (e.g. v1.0.0, sha-abc123456789, or blank for HEAD)"
+        description: "Existing image tag to deploy (e.g. v1.0.0, sha-abc123def456). Blank = promote the image built from the selected tag."
         required: false
         type: string
         default: ""
@@ -24,15 +24,12 @@ concurrency:
   cancel-in-progress: ${{ github.ref_name == 'main' }}
 
 env:
-  SERVICE: mock-app
   IMAGE_NAME: mock-app
 
 jobs:
-  # 1. CI Quality Check (syntax check for mock app)
-  # Runs on PRs, main branch merges, and dev dispatches (skipped on prod promotion)
+  # 1. Quality gate. No `if:` — runs on every trigger and gates both deploy paths.
   check:
     name: Code & Syntax Check
-    if: inputs.target_env != 'prod'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,12 +38,11 @@ jobs:
           python-version: "3.12"
       - run: python -m py_compile app.py
 
-  # 2. Build container once and deploy to Dev
-  # Runs on merge/push to main or manual dispatch targeting dev
+  # 2. The ONLY job that builds a container. Push to main, nothing else.
   build-and-deploy-dev:
     name: Build & Deploy to Dev
     needs: check
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.target_env == 'dev')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     environment: dev
     runs-on: ubuntu-latest
     permissions:
@@ -66,21 +62,17 @@ jobs:
       - name: Configure Docker for Artifact Registry
         run: gcloud auth configure-docker ${{ vars.GCP_REGION }}-docker.pkg.dev --quiet
 
-      - name: Compute tags and version metadata
+      - name: Compute tags
         id: meta
         run: |
-          SHORT_SHA=$(git rev-parse --short=12 HEAD)
-          PKG_VERSION="1.0.0"
+          set -euo pipefail
           IMAGE="${{ vars.GAR_REGISTRY }}/${{ env.IMAGE_NAME }}"
-          DEPLOY_TAG="sha-${SHORT_SHA}"
-          TAGS="${IMAGE}:${DEPLOY_TAG},${IMAGE}:dev-latest"
-          APP_VERSION="${PKG_VERSION}-dev.${SHORT_SHA}"
+          SHORT_SHA=$(git rev-parse --short=12 HEAD)
 
-          echo "image_base=${IMAGE}" >> "$GITHUB_OUTPUT"
-          echo "deploy_tag=${DEPLOY_TAG}" >> "$GITHUB_OUTPUT"
-          echo "app_version=${APP_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "tags=${TAGS}" >> "$GITHUB_OUTPUT"
+          echo "image_base=${IMAGE}"                                >> "$GITHUB_OUTPUT"
+          echo "deploy_tag=sha-${SHORT_SHA}"                        >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}"                             >> "$GITHUB_OUTPUT"
+          echo "tags=${IMAGE}:sha-${SHORT_SHA},${IMAGE}:dev-latest" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -96,25 +88,32 @@ jobs:
           cache-to: type=gha,mode=max,scope=mock-app
 
       - name: Deploy revision to Cloud Run (Dev)
+        env:
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
         run: |
-          SERVICE_NAME="${{ vars.SERVICE_NAME || env.SERVICE }}"
-          IMAGE_TAG="${{ steps.meta.outputs.image_base }}:${{ steps.meta.outputs.deploy_tag }}"
-          echo "Deploying ${IMAGE_TAG} to Dev (${{ vars.GCP_PROJECT_ID }}) service ${SERVICE_NAME}..."
+          set -euo pipefail
+          if [[ -z "${SERVICE_NAME}" ]]; then
+            echo "::error::SERVICE_NAME is not set on the dev environment."
+            exit 1
+          fi
+
+          DEPLOY_IMAGE="${{ steps.meta.outputs.image_base }}:${{ steps.meta.outputs.deploy_tag }}"
+          echo "Deploying ${DEPLOY_IMAGE} to dev service ${SERVICE_NAME}"
 
           gcloud run services update "${SERVICE_NAME}" \
-            --image "${IMAGE_TAG}" \
+            --image "${DEPLOY_IMAGE}" \
             --project "${{ vars.GCP_PROJECT_ID }}" \
             --region "${{ vars.GCP_REGION }}" \
             --service-account "mock-app-runtime@${{ vars.GCP_PROJECT_ID }}.iam.gserviceaccount.com" \
-            --update-env-vars "APP_VERSION=${{ steps.meta.outputs.app_version }},GIT_SHA=${{ steps.meta.outputs.short_sha }}"
+            --update-env-vars "APP_VERSION=${{ steps.meta.outputs.deploy_tag }},GIT_SHA=${{ steps.meta.outputs.short_sha }}"
 
-  # 3. Promote & Deploy to Prod - Zero Rebuild
-  # Triggered exclusively via workflow_dispatch targeting prod
-  promote-and-deploy-prod:
-    name: Promote & Deploy to Prod
-    needs: [check]
-    if: github.event_name == 'workflow_dispatch' && inputs.target_env == 'prod'
-    environment: prod
+  # 3. Promote an existing image. Never builds. Serves both dev and prod.
+  promote:
+    name: Promote to ${{ inputs.target_env }}
+    needs: check
+    if: github.event_name == 'workflow_dispatch'
+    environment:
+      name: ${{ inputs.target_env }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -130,60 +129,80 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Resolve image & release metadata
+      - name: Resolve which image to promote
         id: resolve
         env:
           IMAGE_TAG_INPUT: ${{ inputs.image_tag }}
           REF_NAME: ${{ github.ref_name }}
         run: |
+          set -euo pipefail
           IMAGE="${{ vars.GAR_REGISTRY }}/${{ env.IMAGE_NAME }}"
-          SHORT_SHA=$(git rev-parse --short=12 HEAD)
 
           if [[ -n "${IMAGE_TAG_INPUT}" ]]; then
+            # Redeploy / rollback: the image already exists under this tag.
             SOURCE_IMAGE="${IMAGE}:${IMAGE_TAG_INPUT}"
             DEPLOY_TAG="${IMAGE_TAG_INPUT}"
-            GIT_SHA="rollback"
+            if [[ "${IMAGE_TAG_INPUT}" == sha-* ]]; then
+              GIT_SHA="${IMAGE_TAG_INPUT#sha-}"
+            else
+              GIT_SHA="unknown"
+            fi
           else
+            # Release: promote the image dev already built from this tagged commit.
             if [[ "${GITHUB_REF}" != refs/tags/v* ]]; then
-              echo "::error::Prod releases must run from a v*.*.* tag, or pass image_tag."
+              echo "::error::Run this from a v*.*.* tag, or supply image_tag."
               exit 1
             fi
-            SOURCE_IMAGE="${IMAGE}:sha-${SHORT_SHA}"
+            GIT_SHA=$(git rev-parse --short=12 HEAD)
+            SOURCE_IMAGE="${IMAGE}:sha-${GIT_SHA}"
             DEPLOY_TAG="${REF_NAME}"
-            GIT_SHA="${SHORT_SHA}"
           fi
 
           echo "image_base=${IMAGE}"          >> "$GITHUB_OUTPUT"
-          echo "source_image=${SOURCE_IMAGE}"  >> "$GITHUB_OUTPUT"
-          echo "deploy_tag=${DEPLOY_TAG}"      >> "$GITHUB_OUTPUT"
-          echo "git_sha=${GIT_SHA}"            >> "$GITHUB_OUTPUT"
+          echo "source_image=${SOURCE_IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "deploy_tag=${DEPLOY_TAG}"     >> "$GITHUB_OUTPUT"
+          echo "git_sha=${GIT_SHA}"           >> "$GITHUB_OUTPUT"
+
+          echo "Promoting ${SOURCE_IMAGE} as ${DEPLOY_TAG}"
 
       - name: Verify image exists in Artifact Registry
         run: |
-          echo "Verifying ${{ steps.resolve.outputs.source_image }} exists in Artifact Registry..."
-          gcloud artifacts docker images describe "${{ steps.resolve.outputs.source_image }}" --quiet > /dev/null
+          set -euo pipefail
+          gcloud artifacts docker images describe \
+            "${{ steps.resolve.outputs.source_image }}" --quiet > /dev/null
 
-      - name: Promote tags in Artifact Registry (No Rebuild)
+      - name: Tag image in Artifact Registry (no rebuild)
+        env:
+          TARGET_ENV: ${{ inputs.target_env }}
         run: |
+          set -euo pipefail
           SOURCE="${{ steps.resolve.outputs.source_image }}"
           IMAGE="${{ steps.resolve.outputs.image_base }}"
           TAG="${{ steps.resolve.outputs.deploy_tag }}"
 
-          # If promoting a sha-xyz image to a release tag, stamp the version tag
+          # Stamp the release tag, unless we are already deploying that exact tag.
           if [[ "${SOURCE}" != "${IMAGE}:${TAG}" ]]; then
             echo "Tagging ${SOURCE} -> ${IMAGE}:${TAG}"
             gcloud artifacts docker tags add "${SOURCE}" "${IMAGE}:${TAG}"
           fi
 
-          # Always point prod-latest to this release image for Terraform
-          echo "Tagging ${SOURCE} -> ${IMAGE}:prod-latest"
-          gcloud artifacts docker tags add "${SOURCE}" "${IMAGE}:prod-latest"
+          # Move this environment's pointer.
+          echo "Tagging ${SOURCE} -> ${IMAGE}:${TARGET_ENV}-latest"
+          gcloud artifacts docker tags add "${SOURCE}" "${IMAGE}:${TARGET_ENV}-latest"
 
-      - name: Deploy revision to Cloud Run (Prod)
+      - name: Deploy revision to Cloud Run
+        env:
+          SERVICE_NAME: ${{ vars.SERVICE_NAME }}
+          TARGET_ENV: ${{ inputs.target_env }}
         run: |
-          SERVICE_NAME="${{ vars.SERVICE_NAME || env.SERVICE }}"
+          set -euo pipefail
+          if [[ -z "${SERVICE_NAME}" ]]; then
+            echo "::error::SERVICE_NAME is not set on the ${TARGET_ENV} environment."
+            exit 1
+          fi
+
           DEPLOY_IMAGE="${{ steps.resolve.outputs.image_base }}:${{ steps.resolve.outputs.deploy_tag }}"
-          echo "Deploying ${DEPLOY_IMAGE} to Prod (${{ vars.GCP_PROJECT_ID }}) service ${SERVICE_NAME}..."
+          echo "Deploying ${DEPLOY_IMAGE} to ${TARGET_ENV} service ${SERVICE_NAME}"
 
           gcloud run services update "${SERVICE_NAME}" \
             --image "${DEPLOY_IMAGE}" \
