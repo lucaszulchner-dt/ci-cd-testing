@@ -29,8 +29,10 @@ env:
 
 jobs:
   # 1. CI Quality Check (syntax check for mock app)
+  # Runs on PRs, main branch merges, and dev dispatches (skipped on prod promotion)
   check:
     name: Code & Syntax Check
+    if: inputs.target_env != 'prod'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
