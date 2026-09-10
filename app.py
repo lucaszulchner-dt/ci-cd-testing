@@ -48,3 +48,6 @@ if __name__ == "__main__":
     server = HTTPServer(("0.0.0.0", port), Handler)
     print(f"Mock server running on port {port}")
     server.serve_forever()
+
+
+#simple change to the app cool
